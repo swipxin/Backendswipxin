@@ -13,7 +13,7 @@ import matchingRoutes from './routes/matching.js';
 
 // Configuration
 const PORT = 5002;
-const FRONTEND_URL = "http://localhost:3000";
+const FRONTEND_URL = "https://realswipxin-45ia.vercel.app/onboarding";
 
 const app = express();
 const server = createServer(app);
