@@ -1,6 +1,10 @@
 import jwt from 'jsonwebtoken';
 import { query } from '../config/database.js';
 
+// JWT Configuration
+const JWT_SECRET = "your-super-secret-jwt-key-here-change-in-production";
+const JWT_EXPIRES_IN = "7d";
+
 // JWT Authentication middleware
 export const authenticateToken = async (req, res, next) => {
   try {
@@ -15,7 +19,7 @@ export const authenticateToken = async (req, res, next) => {
     }
 
     // Verify the token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET);
     
     // Get user from database
     const result = await query(
@@ -62,7 +66,7 @@ export const optionalAuth = async (req, res, next) => {
     const token = authHeader && authHeader.split(' ')[1];
 
     if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const decoded = jwt.verify(token, JWT_SECRET);
       const result = await query(
         'SELECT id, email, name, age, country, gender, preferred_gender, avatar_url, is_premium, tokens, is_online, last_seen, total_calls FROM users WHERE id = $1',
         [decoded.userId]
@@ -84,8 +88,8 @@ export const optionalAuth = async (req, res, next) => {
 export const generateToken = (userId) => {
   return jwt.sign(
     { userId },
-    process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
   );
 };
 
@@ -98,7 +102,7 @@ export const socketAuth = async (socket, next) => {
       throw new Error('No token provided');
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET);
     
     const result = await query(
       'SELECT id, email, name, age, country, gender, preferred_gender, avatar_url, is_premium, tokens, is_online FROM users WHERE id = $1',

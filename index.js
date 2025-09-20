@@ -4,7 +4,6 @@ import { Server } from 'socket.io';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import dotenv from 'dotenv';
 import { query } from './config/database.js';
 import { socketAuth } from './middleware/auth.js';
 
@@ -12,20 +11,19 @@ import { socketAuth } from './middleware/auth.js';
 import authRoutes from './routes/auth.js';
 import matchingRoutes from './routes/matching.js';
 
-// Load environment variables
-dotenv.config();
+// Configuration
+const PORT = 5002;
+const FRONTEND_URL = "http://localhost:3000";
 
 const app = express();
 const server = createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: process.env.SOCKET_CORS_ORIGIN || "http://localhost:3000",
+    origin: FRONTEND_URL,
     methods: ["GET", "POST"],
     credentials: true
   }
 });
-
-const PORT = process.env.PORT || 5002;
 
 // Security middleware
 app.use(helmet({
@@ -34,8 +32,8 @@ app.use(helmet({
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: (process.env.RATE_LIMIT_WINDOW || 15) * 60 * 1000, // 15 minutes
-  max: process.env.RATE_LIMIT_MAX || 100,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
   message: {
     success: false,
     message: 'Too many requests from this IP, please try again later.'
@@ -48,7 +46,7 @@ app.use(limiter);
 
 // CORS middleware
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || "http://localhost:3000",
+  origin: FRONTEND_URL,
   credentials: true
 }));
 
@@ -719,9 +717,9 @@ app.use('*', (req, res) => {
 // Start server
 server.listen(PORT, () => {
   console.log(`\u2728 SwipX Backend server running on port ${PORT}`);
-  console.log(`\ud83c\udf10 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`\ud83c\udf10 Environment: development`);
   console.log(`\ud83d\udcca Health check: http://localhost:${PORT}/health`);
-  console.log(`\ud83d\udce1 Socket.IO enabled with CORS: ${process.env.SOCKET_CORS_ORIGIN || "http://localhost:3000"}`);
+  console.log(`\ud83d\udce1 Socket.IO enabled with CORS: ${FRONTEND_URL}`);
 });
 
 // Graceful shutdown
