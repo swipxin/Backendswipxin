@@ -13,13 +13,18 @@ import matchingRoutes from './routes/matching.js';
 
 // Configuration
 const PORT = 5002;
-const FRONTEND_URL = "https://realswipxin-45ia.vercel.app/onboarding";
+const FRONTEND_URLS = [
+  
+  "https://realswipxin-45ia.vercel.app",
+  
+  "http://localhost:3000" // Local development
+];
 
 const app = express();
 const server = createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: FRONTEND_URL,
+    origin: FRONTEND_URLS,
     methods: ["GET", "POST"],
     credentials: true
   }
@@ -46,7 +51,7 @@ app.use(limiter);
 
 // CORS middleware
 app.use(cors({
-  origin: FRONTEND_URL,
+  origin: FRONTEND_URLS,
   credentials: true
 }));
 
@@ -719,7 +724,7 @@ server.listen(PORT, () => {
   console.log(`\u2728 SwipX Backend server running on port ${PORT}`);
   console.log(`\ud83c\udf10 Environment: development`);
   console.log(`\ud83d\udcca Health check: http://localhost:${PORT}/health`);
-  console.log(`\ud83d\udce1 Socket.IO enabled with CORS: ${FRONTEND_URL}`);
+  console.log(`\ud83d\udce1 Socket.IO enabled with CORS:`, FRONTEND_URLS);
 });
 
 // Graceful shutdown
