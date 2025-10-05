@@ -228,7 +228,7 @@ io.on('connection', async (socket) => {
     });
   });
 
-  // Handle joining a video call room (FIXED)
+  // Handle joining a video call room (FIXED WITH ROOM READY EMIT)
   socket.on('joinVideoRoom', (data) => {
     const { roomId, matchId } = data;
     
@@ -249,7 +249,7 @@ io.on('connection', async (socket) => {
         room.participants.push(socket.id);
         console.log(`📹 User ${socket.user.name} joined video room ${roomId} (${room.participants.length} participants)`);
         
-        // Notify both participants that the room is ready
+        // ✅ CRITICAL FIX: Notify both participants that the room is ready
         io.to(roomId).emit('roomReady', {
           roomId,
           matchId,
