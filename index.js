@@ -14,7 +14,8 @@ import matchingRoutes from './routes/matching.js';
 // Configuration
 const PORT = 5002;
 const FRONTEND_URLS = [
-  
+
+  "https://app.swipx.in",
   "https://realswipxin-45ia.vercel.app",
   
   "http://localhost:3000" // Local development
