@@ -190,7 +190,7 @@ io.on('connection', async (socket) => {
     console.log(`🚨 User ${socket.user.name} left matching queue`);
   });
 
-  // ================== WebRTC SIGNALING HANDLERS (FIXED) ==================
+  // ================== WebRTC SIGNALING HANDLERS ==================
   
   // WebRTC Offer handler (from initiator)
   socket.on('webrtc-offer', (data) => {
@@ -228,38 +228,106 @@ io.on('connection', async (socket) => {
     });
   });
 
-  // Handle joining a video call room (FIXED WITH ROOM READY EMIT)
+  // ================== NEXT MATCH & AUTO-RECONNECT HANDLERS ==================
+  
+  // Handle user skipping to next match
+  socket.on('skipMatch', async (data) => {
+    const { roomId, matchId, reason } = data;
+    
+    console.log(`⏭️ User ${socket.user.name} skipped match in room ${roomId} (reason: ${reason || 'user_skipped'})`);
+    
+    // Notify other participant that partner skipped
+    socket.to(roomId).emit('partnerSkipped', {
+      userId: socket.userId,
+      userName: socket.user.name,
+      reason: reason || 'user_skipped'
+    });
+    
+    // Leave room
+    socket.leave(roomId);
+    
+    // Clean up room
+    if (rooms.has(roomId)) {
+      const room = rooms.get(roomId);
+      room.participants = room.participants.filter(id => id !== socket.id);
+      
+      if (room.participants.length === 0) {
+        rooms.delete(roomId);
+        console.log(`🗑️ Room ${roomId} deleted (both users left)`);
+      } else {
+        console.log(`👤 Room ${roomId} now has ${room.participants.length} participant(s)`);
+      }
+    }
+    
+    // Delete active match
+    if (activeMatches.has(matchId)) {
+      activeMatches.delete(matchId);
+      console.log(`🗑️ Match ${matchId} removed from active matches`);
+    }
+    
+    // End match in database
+    try {
+      await query(
+        `UPDATE matches SET ended_at = CURRENT_TIMESTAMP, status = 'ended' WHERE id = $1`,
+        [matchId]
+      );
+      console.log(`✅ Match ${matchId} ended in database`);
+    } catch (error) {
+      console.error('Error ending match in database:', error);
+    }
+  });
+
+  // Handle joining a video call room (FIXED - Prevent overcrowding)
   socket.on('joinVideoRoom', (data) => {
     const { roomId, matchId } = data;
     
-    socket.join(roomId);
+    console.log(`🚪 Join request from ${socket.user.name} for room ${roomId}`);
     
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, {
-        participants: [socket.id],
-        matchId,
-        createdAt: Date.now()
-      });
-      console.log(`📹 User ${socket.user.name} created video room ${roomId}`);
-    } else {
+    // Check if room exists and is full
+    if (rooms.has(roomId)) {
       const room = rooms.get(roomId);
       
-      // Prevent duplicate joins
-      if (!room.participants.includes(socket.id)) {
-        room.participants.push(socket.id);
-        console.log(`📹 User ${socket.user.name} joined video room ${roomId} (${room.participants.length} participants)`);
-        
-        // ✅ CRITICAL FIX: Notify both participants that the room is ready
+      // Room full check - MAX 2 participants
+      if (room.participants.length >= 2 && !room.participants.includes(socket.id)) {
+        console.log(`❌ Room ${roomId} is FULL (${room.participants.length} participants)`);
+        socket.emit('roomFull', { 
+          message: 'This video room is already full.',
+          roomId 
+        });
+        return;
+      }
+      
+      // Already in room check
+      if (room.participants.includes(socket.id)) {
+        console.log(`⚠️ User ${socket.user.name} already in room ${roomId}`);
+        return;
+      }
+      
+      // Add second participant
+      room.participants.push(socket.id);
+      socket.join(roomId);
+      console.log(`📹 User ${socket.user.name} joined room ${roomId} (${room.participants.length}/2)`);
+      
+      // Emit roomReady ONLY when exactly 2 participants
+      if (room.participants.length === 2) {
         io.to(roomId).emit('roomReady', {
           roomId,
           matchId,
-          participants: room.participants.length
+          participants: 2
         });
-        
-        console.log(`✅ Room ${roomId} is ready for WebRTC negotiation`);
-      } else {
-        console.log(`⚠️ User ${socket.user.name} already in room ${roomId}`);
+        console.log(`✅ Room ${roomId} ready for WebRTC (2 participants)`);
       }
+      
+    } else {
+      // Create new room
+      rooms.set(roomId, {
+        participants: [socket.id],
+        matchId,
+        createdAt: Date.now(),
+        maxParticipants: 2
+      });
+      socket.join(roomId);
+      console.log(`📹 User ${socket.user.name} created room ${roomId} (1/2)`);
     }
   });
 
