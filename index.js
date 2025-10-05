@@ -12,16 +12,18 @@ import authRoutes from './routes/auth.js';
 import matchingRoutes from './routes/matching.js';
 
 // Configuration
-const PORT = 5002;
+const PORT = process.env.PORT || 5002;
 const FRONTEND_URLS = [
-
   "https://app.swipx.in",
   "https://realswipxin-45ia.vercel.app",
-  
   "http://localhost:3000" // Local development
 ];
 
 const app = express();
+
+// ✅ FIXED: Trust proxy for Render deployment
+app.set('trust proxy', 1);
+
 const server = createServer(app);
 const io = new Server(server, {
   cors: {
@@ -85,7 +87,7 @@ const rooms = new Map(); // roomId -> { participants: [socketId1, socketId2], ma
 
 // Socket.IO connection handling
 io.on('connection', async (socket) => {
-  console.log(`\u2705 User connected: ${socket.user.name} (${socket.userId})`);
+  console.log(`✅ User connected: ${socket.user.name} (${socket.userId})`);
   
   // Add user to active users
   activeUsers.set(socket.userId, {
@@ -127,7 +129,7 @@ io.on('connection', async (socket) => {
   // Handle user joining matching queue
   socket.on('joinMatchingQueue', async (preferences = {}) => {
     try {
-      console.log(`\ud83d\udd0d User ${socket.user.name} joined matching queue with preferences:`, preferences);
+      console.log(`🔍 User ${socket.user.name} joined matching queue with preferences:`, preferences);
       
       // Check if user has enough tokens
       if (socket.user.tokens < 1) {
@@ -145,7 +147,7 @@ io.on('connection', async (socket) => {
         joinedAt: Date.now()
       });
 
-      console.log(`\ud83d\udcca Queue size after adding ${socket.user.name}: ${waitingUsers.size}`);
+      console.log(`📊 Queue size after adding ${socket.user.name}: ${waitingUsers.size}`);
 
       socket.emit('matchingStatus', {
         status: 'searching',
@@ -158,14 +160,14 @@ io.on('connection', async (socket) => {
       // If no match found, but there are multiple users in queue, 
       // try to process the entire queue to find any possible matches
       if (!matchFound && waitingUsers.size >= 2) {
-        console.log(`\ud83d\udd04 No immediate match found, processing entire queue...`);
+        console.log(`🔄 No immediate match found, processing entire queue...`);
         await processMatchingQueue();
       }
       
       // Trigger matching for all waiting users when someone new joins
       if (waitingUsers.size >= 2) {
         setTimeout(async () => {
-          console.log(`\ud83d\udd0d Auto-triggering match processing for ${waitingUsers.size} users...`);
+          console.log(`🔍 Auto-triggering match processing for ${waitingUsers.size} users...`);
           await processMatchingQueue();
         }, 1000); // Small delay to ensure all users are properly added to queue
       }
@@ -185,30 +187,48 @@ io.on('connection', async (socket) => {
       status: 'idle',
       message: 'Stopped searching for matches'
     });
-    console.log(`\ud83d\udea8 User ${socket.user.name} left matching queue`);
+    console.log(`🚨 User ${socket.user.name} left matching queue`);
   });
 
-  // Handle WebRTC signaling
-  socket.on('webrtc-signal', (data) => {
-    const { roomId, signal, targetUserId } = data;
+  // ================== WebRTC SIGNALING HANDLERS (FIXED) ==================
+  
+  // WebRTC Offer handler (from initiator)
+  socket.on('webrtc-offer', (data) => {
+    const { roomId, offer } = data;
+    console.log(`📤 [WebRTC] Offer from ${socket.user.name} to room ${roomId}`);
     
-    if (rooms.has(roomId)) {
-      // Forward signal to the other participant in the room
-      const room = rooms.get(roomId);
-      const targetSocketId = room.participants.find(id => id !== socket.id);
-      
-      if (targetSocketId) {
-        io.to(targetSocketId).emit('webrtc-signal', {
-          signal,
-          fromUserId: socket.userId,
-          roomId
-        });
-        console.log(`\ud83d\udce1 WebRTC signal forwarded in room ${roomId}`);
-      }
-    }
+    socket.to(roomId).emit('webrtc-offer', {
+      offer: offer,
+      from: socket.userId,
+      fromName: socket.user.name
+    });
   });
 
-  // Handle joining a video call room
+  // WebRTC Answer handler (from receiver)
+  socket.on('webrtc-answer', (data) => {
+    const { roomId, answer } = data;
+    console.log(`📤 [WebRTC] Answer from ${socket.user.name} to room ${roomId}`);
+    
+    socket.to(roomId).emit('webrtc-answer', {
+      answer: answer,
+      from: socket.userId,
+      fromName: socket.user.name
+    });
+  });
+
+  // ICE Candidate handler
+  socket.on('ice-candidate', (data) => {
+    const { roomId, candidate } = data;
+    console.log(`🧊 [WebRTC] ICE candidate from ${socket.user.name}`);
+    
+    socket.to(roomId).emit('ice-candidate', {
+      candidate: candidate,
+      from: socket.userId,
+      fromName: socket.user.name
+    });
+  });
+
+  // Handle joining a video call room (FIXED)
   socket.on('joinVideoRoom', (data) => {
     const { roomId, matchId } = data;
     
@@ -220,19 +240,27 @@ io.on('connection', async (socket) => {
         matchId,
         createdAt: Date.now()
       });
+      console.log(`📹 User ${socket.user.name} created video room ${roomId}`);
     } else {
       const room = rooms.get(roomId);
-      room.participants.push(socket.id);
       
-      // Notify both participants that the room is ready
-      io.to(roomId).emit('roomReady', {
-        roomId,
-        matchId,
-        participants: room.participants.length
-      });
+      // Prevent duplicate joins
+      if (!room.participants.includes(socket.id)) {
+        room.participants.push(socket.id);
+        console.log(`📹 User ${socket.user.name} joined video room ${roomId} (${room.participants.length} participants)`);
+        
+        // Notify both participants that the room is ready
+        io.to(roomId).emit('roomReady', {
+          roomId,
+          matchId,
+          participants: room.participants.length
+        });
+        
+        console.log(`✅ Room ${roomId} is ready for WebRTC negotiation`);
+      } else {
+        console.log(`⚠️ User ${socket.user.name} already in room ${roomId}`);
+      }
     }
-    
-    console.log(`\ud83d\udcf9 User ${socket.user.name} joined video room ${roomId}`);
   });
 
   // Handle leaving a video call room
@@ -253,7 +281,7 @@ io.on('connection', async (socket) => {
         if (matchId) {
           try {
             await query('SELECT end_match($1, $2)', [matchId, socket.userId]);
-            console.log(`\ud83d\udd1a Match ${matchId} ended`);
+            console.log(`🔚 Match ${matchId} ended`);
           } catch (error) {
             console.error('Error ending match:', error);
           }
@@ -267,7 +295,7 @@ io.on('connection', async (socket) => {
       }
     }
     
-    console.log(`\ud83d\udeaa User ${socket.user.name} left video room ${roomId}`);
+    console.log(`🚪 User ${socket.user.name} left video room ${roomId}`);
   });
 
   // Handle chat messages
@@ -303,7 +331,7 @@ io.on('connection', async (socket) => {
           createdAt: message.created_at
         });
         
-        console.log(`\ud83d\udcac Message sent in match ${matchId} by ${socket.user.name}`);
+        console.log(`💬 Message sent in match ${matchId} by ${socket.user.name}`);
       }
     } catch (error) {
       console.error('Error sending message:', error);
@@ -351,7 +379,7 @@ io.on('connection', async (socket) => {
 
   // Handle disconnect
   socket.on('disconnect', async () => {
-    console.log(`\ud83d\udd34 User disconnected: ${socket.user.name} (${socket.userId})`);
+    console.log(`🔴 User disconnected: ${socket.user.name} (${socket.userId})`);
     
     // Remove from active users
     activeUsers.delete(socket.userId);
@@ -721,26 +749,26 @@ app.use('*', (req, res) => {
 });
 
 // Start server
-server.listen(PORT, () => {
-  console.log(`\u2728 SwipX Backend server running on port ${PORT}`);
-  console.log(`\ud83c\udf10 Environment: development`);
-  console.log(`\ud83d\udcca Health check: http://localhost:${PORT}/health`);
-  console.log(`\ud83d\udce1 Socket.IO enabled with CORS:`, FRONTEND_URLS);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✨ SwipX Backend server running on port ${PORT}`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`📡 Socket.IO enabled with CORS:`, FRONTEND_URLS);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-  console.log('\ud83d\udea8 SIGTERM received, shutting down gracefully...');
+  console.log('🚨 SIGTERM received, shutting down gracefully...');
   server.close(() => {
-    console.log('\u2705 Server closed');
+    console.log('✅ Server closed');
     process.exit(0);
   });
 });
 
 process.on('SIGINT', async () => {
-  console.log('\ud83d\udea8 SIGINT received, shutting down gracefully...');
+  console.log('🚨 SIGINT received, shutting down gracefully...');
   server.close(() => {
-    console.log('\u2705 Server closed');
+    console.log('✅ Server closed');
     process.exit(0);
   });
 });
