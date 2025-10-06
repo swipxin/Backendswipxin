@@ -98,15 +98,11 @@ io.on('connection', async (socket) => {
 
   socket.broadcast.emit('userOnline', { userId: socket.userId, user: socket.user });
 
-  // ============================================
-  // 🎯 ADVANCED MATCHING WITH FILTERS
-  // ============================================
   socket.on('joinMatchingQueue', async (preferences = {}) => {
     try {
       const user = socket.user;
       console.log(`🔍 ${user.name} joining queue with filters:`, preferences);
 
-      // ✅ PREMIUM CHECK
       if (user.is_premium) {
         if (user.tokens < 8) {
           console.log(`⚠️ ${user.name} insufficient tokens (${user.tokens})`);
@@ -114,7 +110,6 @@ io.on('connection', async (socket) => {
           return;
         }
       } else {
-        // ✅ FREE USERS - NO FILTERS ALLOWED
         if (preferences.gender || preferences.country) {
           socket.emit('matchingError', { 
             message: 'Gender and Country filters are Premium features! Upgrade to Premium to use filters.' 
@@ -123,7 +118,6 @@ io.on('connection', async (socket) => {
         }
       }
 
-      // ✅ ADD TO QUEUE WITH PREFERENCES
       waitingUsers.set(socket.userId, { 
         user, 
         preferences: {
@@ -163,31 +157,55 @@ io.on('connection', async (socket) => {
     socket.emit('matchingStatus', { status: 'idle' });
   });
 
+  // ============================================
+  // 🔧 FIXED: joinVideoRoom with delay
+  // ============================================
   socket.on('joinVideoRoom', (data) => {
     const { roomId, matchId } = data;
-    console.log(`🚪 ${socket.user.name} → ${roomId}`);
+    console.log(`🚪 ${socket.user.name} → ${roomId} (socket: ${socket.id})`);
     
     if (rooms.has(roomId)) {
       const room = rooms.get(roomId);
       
       if (room.participants.includes(socket.id)) {
-        console.log(`⚠️ Already in`);
+        console.log(`⚠️ ${socket.user.name} already in room`);
         return;
       }
       
       if (room.participants.length >= 2) {
-        console.log(`❌ FULL`);
+        console.log(`❌ Room ${roomId} FULL (${room.participants.length}/2)`);
         socket.emit('roomFull', { roomId });
         return;
       }
       
       room.participants.push(socket.id);
       socket.join(roomId);
-      console.log(`✅ ${roomId} (${room.participants.length}/2)`);
+      console.log(`✅ ${socket.user.name} joined ${roomId} (${room.participants.length}/2)`);
       
       if (room.participants.length === 2) {
-        console.log(`🎬 READY: ${roomId}`);
-        io.to(roomId).emit('roomReady', { roomId, matchId, participants: 2 });
+        console.log(`🎬 Room ${roomId} is READY with 2 participants`);
+        console.log(`   Participants:`, room.participants);
+        
+        // ✅ CRITICAL FIX: Add 500ms delay + dual emission
+        setTimeout(() => {
+          console.log(`📤 Emitting roomReady to room: ${roomId}`);
+          
+          // Method 1: Emit to room
+          io.to(roomId).emit('roomReady', { roomId, matchId, participants: 2 });
+          
+          // Method 2: Direct emit to each socket (backup)
+          room.participants.forEach((participantSocketId, index) => {
+            io.to(participantSocketId).emit('roomReady', { 
+              roomId, 
+              matchId, 
+              participants: 2,
+              isInitiator: index === 0 // First user is initiator
+            });
+            console.log(`   📤 Direct roomReady → socket ${participantSocketId}`);
+          });
+          
+          console.log(`✅ roomReady emitted successfully`);
+        }, 500); // 500ms delay to ensure frontend listeners attached
       }
     } else {
       rooms.set(roomId, { 
@@ -197,13 +215,14 @@ io.on('connection', async (socket) => {
         maxParticipants: 2 
       });
       socket.join(roomId);
-      console.log(`📦 CREATE ${roomId} (1/2)`);
+      console.log(`📦 ${socket.user.name} CREATED room ${roomId} (1/2)`);
     }
   });
 
   socket.on('leaveVideoRoom', async (data) => {
     const { roomId } = data;
     socket.leave(roomId);
+    console.log(`🚪 ${socket.user.name} left ${roomId}`);
 
     if (rooms.has(roomId)) {
       const room = rooms.get(roomId);
@@ -211,6 +230,7 @@ io.on('connection', async (socket) => {
 
       if (room.participants.length === 0) {
         rooms.delete(roomId);
+        console.log(`🗑️ Room ${roomId} deleted (empty)`);
       } else {
         socket.to(roomId).emit('participantLeft', { userId: socket.userId, roomId });
       }
@@ -218,6 +238,7 @@ io.on('connection', async (socket) => {
   });
 
   socket.on('webrtc-offer', (data) => {
+    console.log(`📤 ${socket.user.name} sending offer to room ${data.roomId}`);
     socket.to(data.roomId).emit('webrtc-offer', { 
       offer: data.offer, 
       from: socket.userId, 
@@ -226,6 +247,7 @@ io.on('connection', async (socket) => {
   });
 
   socket.on('webrtc-answer', (data) => {
+    console.log(`📤 ${socket.user.name} sending answer to room ${data.roomId}`);
     socket.to(data.roomId).emit('webrtc-answer', { 
       answer: data.answer, 
       from: socket.userId, 
@@ -310,7 +332,7 @@ io.on('connection', async (socket) => {
   });
 
   socket.on('disconnect', async () => {
-    console.log(`🔴 ${socket.user.name}`);
+    console.log(`🔴 ${socket.user.name} disconnected`);
     
     activeUsers.delete(socket.userId);
     waitingUsers.delete(socket.userId);
@@ -336,9 +358,6 @@ io.on('connection', async (socket) => {
   });
 });
 
-// ============================================
-// 🎯 MATCHING ALGORITHM WITH FILTERS
-// ============================================
 async function findMatchWithFilters(userId) {
   try {
     const waitingUser = waitingUsers.get(userId);
@@ -348,7 +367,6 @@ async function findMatchWithFilters(userId) {
     let matchedUserId = null;
     let matchedUserData = null;
     
-    // ✅ FIND MATCH WITH FILTER LOGIC
     for (const [otherUserId, otherUserData] of waitingUsers.entries()) {
       if (otherUserId === userId) continue;
       
@@ -359,7 +377,6 @@ async function findMatchWithFilters(userId) {
 
       let isMatch = true;
 
-      // ✅ CHECK USER'S PREFERENCES
       if (userPrefs.gender && otherUser.gender !== userPrefs.gender) {
         isMatch = false;
       }
@@ -370,7 +387,6 @@ async function findMatchWithFilters(userId) {
         isMatch = false;
       }
 
-      // ✅ CHECK OTHER USER'S PREFERENCES
       if (otherPrefs.gender && waitingUser.user.gender !== otherPrefs.gender) {
         isMatch = false;
       }
@@ -391,7 +407,6 @@ async function findMatchWithFilters(userId) {
     if (matchedUserId && matchedUserData) {
       console.log(`🎯 MATCH: ${waitingUser.user.name} ↔ ${matchedUserData.user.name}`);
 
-      // ✅ TOKEN DEDUCTION FOR PREMIUM USERS
       const idsToDeduct = [];
       if (waitingUser.user.is_premium) idsToDeduct.push(userId);
       if (matchedUserData.user.is_premium) idsToDeduct.push(matchedUserId);
@@ -474,9 +489,6 @@ async function processMatchingQueue() {
   }
 }
 
-// ============================================
-// BACKGROUND JOBS
-// ============================================
 setInterval(async () => {
   if (waitingUsers.size >= 2) {
     await processMatchingQueue();
@@ -503,7 +515,6 @@ setInterval(() => {
   }
 }, 60_000);
 
-// ✅ PREMIUM EXPIRY CHECK
 setInterval(async () => {
   try {
     await query('UPDATE users SET is_premium = false WHERE premium_expiry_date < CURRENT_TIMESTAMP AND is_premium = true');
