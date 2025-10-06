@@ -7,7 +7,7 @@ import { generateToken, authenticateToken } from '../middleware/auth.js';
 const router = express.Router();
 
 // ============================================
-// VALIDATION RULES
+// SIMPLIFIED VALIDATION RULES (NO STRICT CHECKS)
 // ============================================
 
 const registerValidation = [
@@ -17,30 +17,17 @@ const registerValidation = [
     .withMessage('Valid email is required'),
   body('password')
     .isLength({ min: 6, max: 50 })
-    .withMessage('Password must be between 6 and 50 characters')
-    .matches(/^(?=.*[a-zA-Z])(?=.*[0-9])/)
-    .withMessage('Password must contain at least one letter and one number'),
+    .withMessage('Password must be at least 6 characters'),
   body('name')
     .trim()
-    .isLength({ min: 2, max: 50 })
-    .withMessage('Name must be between 2 and 50 characters')
-    .matches(/^[a-zA-Z\s]+$/)
-    .withMessage('Name can only contain letters and spaces'),
+    .isLength({ min: 2, max: 100 })
+    .withMessage('Name must be between 2 and 100 characters'),
   body('age')
     .isInt({ min: 18, max: 100 })
     .withMessage('Age must be between 18 and 100'),
-  body('country')
-    .optional()
-    .trim()
-    .isLength({ min: 2, max: 100 })
-    .withMessage('Country must be between 2 and 100 characters'),
   body('gender')
     .isIn(['male', 'female', 'other'])
-    .withMessage('Gender must be male, female, or other'),
-  body('preferredGender')
-    .optional()
-    .isIn(['male', 'female', 'other'])
-    .withMessage('Preferred gender must be male, female, or other')
+    .withMessage('Gender must be male, female, or other')
 ];
 
 const loginValidation = [
@@ -54,7 +41,7 @@ const loginValidation = [
 ];
 
 // ============================================
-// EMAIL AVAILABILITY CHECK (REAL-TIME)
+// EMAIL AVAILABILITY CHECK
 // ============================================
 
 router.post('/check-email', async (req, res) => {
@@ -87,11 +74,11 @@ router.post('/check-email', async (req, res) => {
     res.json({
       success: true,
       available: isAvailable,
-      message: isAvailable ? '✅ Email available' : '❌ Email already taken'
+      message: isAvailable ? 'Email available' : 'Email already taken'
     });
 
   } catch (error) {
-    console.error('❌ Email check error:', error);
+    console.error('Email check error:', error);
     res.status(500).json({
       success: false,
       message: 'Check failed'
@@ -100,40 +87,29 @@ router.post('/check-email', async (req, res) => {
 });
 
 // ============================================
-// REGISTER ENDPOINT
+// REGISTER ENDPOINT (FIXED)
 // ============================================
 
 router.post('/register', registerValidation, async (req, res) => {
   try {
-    console.log('📝 Registration attempt:', {
-      email: req.body.email,
-      name: req.body.name,
-      age: req.body.age,
-      gender: req.body.gender
-    });
+    console.log('📝 Registration attempt:', req.body);
 
     // Check validation errors
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       console.log('⚠️ Validation errors:', errors.array());
 
-      // Format errors for frontend
-      const formattedErrors = {};
-      errors.array().forEach(error => {
-        formattedErrors[error.path || error.param] = error.msg;
-      });
-
       return res.status(400).json({
         success: false,
         message: 'Validation failed',
-        errors: formattedErrors
+        errors: errors.array()
       });
     }
 
     const { email, password, name, age, country, gender, preferredGender } = req.body;
 
-    // Set default country if not provided
-    const userCountry = country || 'Unknown';
+    // Set default country if not provided or empty
+    const userCountry = (country && country.trim()) ? country.trim() : 'Unknown';
 
     // Check if user already exists
     const existingUser = await query(
@@ -144,8 +120,8 @@ router.post('/register', registerValidation, async (req, res) => {
     if (existingUser.rows.length > 0) {
       return res.status(409).json({
         success: false,
-        message: 'Email already registered',
-        errors: { email: 'This email is already taken' }
+        message: 'User with this email already exists',
+        errors: [{ msg: 'Email already registered', param: 'email', location: 'body' }]
       });
     }
 
@@ -170,32 +146,19 @@ router.post('/register', registerValidation, async (req, res) => {
     // Create welcome transaction for FREE account
     await query(
       'INSERT INTO transactions (user_id, type, tokens, description) VALUES ($1, $2, $3, $4)',
-      [user.id, 'signup', 0, 'Free account created - upgrade to premium for filters and tokens!']
+      [user.id, 'signup', 0, 'Free account created - upgrade to premium for tokens!']
     );
 
-    // Generate JWT token
+    // Generate token
     const token = generateToken(user.id);
 
     console.log(`✅ Registration successful: ${user.name} (${user.email})`);
 
     res.status(201).json({
       success: true,
-      message: '🎉 Account created successfully! Welcome to SwipX!',
+      message: 'Account created successfully! Welcome to SwipX!',
       data: {
-        user: {
-          id: user.id,
-          email: user.email,
-          name: user.name,
-          age: user.age,
-          country: user.country,
-          gender: user.gender,
-          avatar_url: user.avatar_url,
-          is_premium: user.is_premium,
-          tokens: user.tokens,
-          is_online: user.is_online,
-          total_calls: user.total_calls,
-          created_at: user.created_at
-        },
+        user,
         token
       }
     });
@@ -203,12 +166,12 @@ router.post('/register', registerValidation, async (req, res) => {
   } catch (error) {
     console.error('❌ Registration error:', error);
 
-    // Handle specific database errors
-    if (error.code === '23505') { // Unique violation
+    // Handle duplicate email error
+    if (error.code === '23505') {
       return res.status(409).json({
         success: false,
-        message: 'Email already registered',
-        errors: { email: 'This email is already taken' }
+        message: 'User with this email already exists',
+        errors: [{ msg: 'Email already registered', param: 'email', location: 'body' }]
       });
     }
 
@@ -230,15 +193,10 @@ router.post('/login', loginValidation, async (req, res) => {
     // Check validation errors
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      const formattedErrors = {};
-      errors.array().forEach(error => {
-        formattedErrors[error.path || error.param] = error.msg;
-      });
-
       return res.status(400).json({
         success: false,
         message: 'Validation failed',
-        errors: formattedErrors
+        errors: errors.array()
       });
     }
 
@@ -256,7 +214,7 @@ router.post('/login', loginValidation, async (req, res) => {
       return res.status(401).json({
         success: false,
         message: 'Invalid email or password',
-        errors: { email: 'No account found with this email' }
+        errors: [{ msg: 'Invalid credentials', param: 'email', location: 'body' }]
       });
     }
 
@@ -268,7 +226,7 @@ router.post('/login', loginValidation, async (req, res) => {
       return res.status(401).json({
         success: false,
         message: 'Invalid email or password',
-        errors: { password: 'Incorrect password' }
+        errors: [{ msg: 'Invalid credentials', param: 'password', location: 'body' }]
       });
     }
 
@@ -308,7 +266,7 @@ router.post('/login', loginValidation, async (req, res) => {
 
     res.json({
       success: true,
-      message: '🎉 Login successful! Welcome back!',
+      message: 'Login successful! Welcome back!',
       data: {
         user,
         token
@@ -353,7 +311,7 @@ router.get('/me', authenticateToken, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('❌ Get profile error:', error);
+    console.error('Get profile error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to get user profile'
@@ -366,34 +324,28 @@ router.get('/me', authenticateToken, async (req, res) => {
 // ============================================
 
 router.put('/profile', authenticateToken, [
-  body('name').optional().trim().isLength({ min: 2, max: 50 }),
+  body('name').optional().trim().isLength({ min: 2, max: 100 }),
   body('age').optional().isInt({ min: 18, max: 100 }),
   body('country').optional().trim().isLength({ min: 2, max: 100 }),
   body('gender').optional().isIn(['male', 'female', 'other']),
   body('preferredGender').optional().isIn(['male', 'female', 'other']),
   body('bio').optional().trim().isLength({ max: 500 }),
   body('interests').optional().isArray({ max: 10 }),
-  body('tokens').optional().isInt({ min: 0 }).withMessage('Tokens must be a non-negative integer')
+  body('tokens').optional().isInt({ min: 0 })
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      const formattedErrors = {};
-      errors.array().forEach(error => {
-        formattedErrors[error.path || error.param] = error.msg;
-      });
-
       return res.status(400).json({
         success: false,
         message: 'Validation failed',
-        errors: formattedErrors
+        errors: errors.array()
       });
     }
 
     const updates = {};
     const allowedFields = ['name', 'age', 'country', 'gender', 'preferred_gender', 'bio', 'interests', 'tokens'];
 
-    // Build update object with only provided fields
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
@@ -407,7 +359,6 @@ router.put('/profile', authenticateToken, [
       });
     }
 
-    // Build SQL query dynamically
     const setClause = Object.keys(updates).map((key, index) =>
       `${key} = $${index + 2}`
     ).join(', ');
@@ -423,18 +374,16 @@ router.put('/profile', authenticateToken, [
       values
     );
 
-    console.log(`✅ Profile updated: ${result.rows[0].name}`);
-
     res.json({
       success: true,
-      message: '✅ Profile updated successfully',
+      message: 'Profile updated successfully',
       data: {
         user: result.rows[0]
       }
     });
 
   } catch (error) {
-    console.error('❌ Update profile error:', error);
+    console.error('Update profile error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to update profile'
@@ -454,14 +403,12 @@ router.post('/logout', authenticateToken, async (req, res) => {
       [req.user.id]
     );
 
-    console.log(`👋 User logged out: ${req.user.id}`);
-
     res.json({
       success: true,
-      message: '✅ Logged out successfully'
+      message: 'Logged out successfully'
     });
   } catch (error) {
-    console.error('❌ Logout error:', error);
+    console.error('Logout error:', error);
     res.status(500).json({
       success: false,
       message: 'Logout failed'
@@ -480,15 +427,10 @@ router.post('/purchase-premium', authenticateToken, [
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      const formattedErrors = {};
-      errors.array().forEach(error => {
-        formattedErrors[error.path || error.param] = error.msg;
-      });
-
       return res.status(400).json({
         success: false,
         message: 'Validation failed',
-        errors: formattedErrors
+        errors: errors.array()
       });
     }
 
@@ -531,7 +473,7 @@ router.post('/purchase-premium', authenticateToken, [
 
     res.json({
       success: true,
-      message: `🎉 Premium ${plan} plan activated! You now have ${result.rows[0].tokens} tokens.`,
+      message: `Premium ${plan} plan activated! You now have ${result.rows[0].tokens} tokens.`,
       data: {
         user: result.rows[0],
         plan: selectedPlan
@@ -539,7 +481,7 @@ router.post('/purchase-premium', authenticateToken, [
     });
 
   } catch (error) {
-    console.error('❌ Premium purchase error:', error);
+    console.error('Premium purchase error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to process premium purchase'
@@ -553,9 +495,8 @@ router.post('/purchase-premium', authenticateToken, [
 
 router.post('/deduct-tokens', authenticateToken, async (req, res) => {
   try {
-    const tokenCost = 8; // Cost per video call connection
+    const tokenCost = 8;
 
-    // Get current user tokens
     const userResult = await query(
       'SELECT tokens, is_premium FROM users WHERE id = $1',
       [req.user.id]
@@ -570,7 +511,6 @@ router.post('/deduct-tokens', authenticateToken, async (req, res) => {
 
     const user = userResult.rows[0];
 
-    // Check if user is premium and has enough tokens
     if (!user.is_premium) {
       return res.status(403).json({
         success: false,
@@ -587,7 +527,6 @@ router.post('/deduct-tokens', authenticateToken, async (req, res) => {
       });
     }
 
-    // Deduct tokens
     const updateResult = await query(
       `UPDATE users SET 
         tokens = tokens - $1,
@@ -597,7 +536,6 @@ router.post('/deduct-tokens', authenticateToken, async (req, res) => {
       [tokenCost, req.user.id]
     );
 
-    // Log token deduction transaction
     await query(
       'INSERT INTO transactions (user_id, type, tokens, description) VALUES ($1, $2, $3, $4)',
       [req.user.id, 'call', -tokenCost, 'Video call connection - 8 tokens deducted']
@@ -605,7 +543,6 @@ router.post('/deduct-tokens', authenticateToken, async (req, res) => {
 
     const remainingTokens = updateResult.rows[0].tokens;
 
-    // Check if user should be downgraded to free
     if (remainingTokens <= 0) {
       await query(
         'UPDATE users SET is_premium = false, preferred_gender = null WHERE id = $1',
@@ -632,7 +569,7 @@ router.post('/deduct-tokens', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Token deduction error:', error);
+    console.error('Token deduction error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to deduct tokens'
@@ -646,19 +583,16 @@ router.post('/deduct-tokens', authenticateToken, async (req, res) => {
 
 router.get('/stats', authenticateToken, async (req, res) => {
   try {
-    // Get user stats
     const userStats = await query(
       'SELECT total_calls, tokens, is_premium, created_at FROM users WHERE id = $1',
       [req.user.id]
     );
 
-    // Get transaction history
     const transactions = await query(
       'SELECT type, tokens, amount, description, created_at FROM transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
       [req.user.id]
     );
 
-    // Get match history count
     const matchHistory = await query(
       'SELECT COUNT(*) as total_matches FROM matches WHERE (user1_id = $1 OR user2_id = $1) AND status = $2',
       [req.user.id, 'ended']
@@ -674,7 +608,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Get stats error:', error);
+    console.error('Get stats error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to get user statistics'
