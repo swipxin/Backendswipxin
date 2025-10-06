@@ -7,7 +7,7 @@ import { generateToken, authenticateToken } from '../middleware/auth.js';
 const router = express.Router();
 
 // ============================================
-// SIMPLIFIED VALIDATION RULES (NO STRICT CHECKS)
+// VALIDATION RULES
 // ============================================
 
 const registerValidation = [
@@ -65,8 +65,8 @@ router.post('/check-email', async (req, res) => {
     }
 
     const result = await query(
-      'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
-      [email.trim()]
+      'SELECT id FROM users WHERE email = $1',
+      [email.toLowerCase().trim()]
     );
 
     const isAvailable = result.rows.length === 0;
@@ -87,18 +87,21 @@ router.post('/check-email', async (req, res) => {
 });
 
 // ============================================
-// REGISTER ENDPOINT (FIXED)
+// REGISTER ENDPOINT (MINIMAL COLUMNS)
 // ============================================
 
 router.post('/register', registerValidation, async (req, res) => {
   try {
-    console.log('📝 Registration attempt:', req.body);
+    console.log('📝 Registration request:', {
+      email: req.body.email,
+      name: req.body.name,
+      age: req.body.age,
+      gender: req.body.gender
+    });
 
-    // Check validation errors
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       console.log('⚠️ Validation errors:', errors.array());
-
       return res.status(400).json({
         success: false,
         message: 'Validation failed',
@@ -106,22 +109,22 @@ router.post('/register', registerValidation, async (req, res) => {
       });
     }
 
-    const { email, password, name, age, country, gender, preferredGender } = req.body;
+    const { email, password, name, age, country, gender } = req.body;
 
-    // Set default country if not provided or empty
-    const userCountry = (country && country.trim()) ? country.trim() : 'Unknown';
+    // Set default country
+    const userCountry = country || 'Unknown';
 
-    // Check if user already exists
+    // Check if user exists
     const existingUser = await query(
-      'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
-      [email.trim()]
+      'SELECT id FROM users WHERE email = $1',
+      [email.toLowerCase().trim()]
     );
 
     if (existingUser.rows.length > 0) {
+      console.log('⚠️ Email already exists:', email);
       return res.status(409).json({
         success: false,
-        message: 'User with this email already exists',
-        errors: [{ msg: 'Email already registered', param: 'email', location: 'body' }]
+        message: 'User with this email already exists'
       });
     }
 
@@ -129,30 +132,32 @@ router.post('/register', registerValidation, async (req, res) => {
     const saltRounds = 12;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
-    // Create user with FREE account (0 tokens, no premium features)
+    console.log('💾 Inserting user into database...');
+
+    // ✅ MINIMAL INSERT - ONLY CORE COLUMNS
     const result = await query(
-      `INSERT INTO users (
-        email, password_hash, name, age, country, gender, preferred_gender, 
-        tokens, is_premium, is_online, created_at
-      ) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, 0, false, true, CURRENT_TIMESTAMP) 
-      RETURNING id, email, name, age, country, gender, preferred_gender, 
-                avatar_url, is_premium, tokens, is_online, total_calls, created_at`,
-      [email.toLowerCase().trim(), passwordHash, name.trim(), age, userCountry, gender, null]
+      `INSERT INTO users (email, password_hash, name, age, country, gender) 
+       VALUES ($1, $2, $3, $4, $5, $6) 
+       RETURNING *`,
+      [
+        email.toLowerCase().trim(),
+        passwordHash,
+        name.trim(),
+        age,
+        userCountry,
+        gender
+      ]
     );
 
     const user = result.rows[0];
 
-    // Create welcome transaction for FREE account
-    await query(
-      'INSERT INTO transactions (user_id, type, tokens, description) VALUES ($1, $2, $3, $4)',
-      [user.id, 'signup', 0, 'Free account created - upgrade to premium for tokens!']
-    );
-
-    // Generate token
+    // Generate JWT token
     const token = generateToken(user.id);
 
-    console.log(`✅ Registration successful: ${user.name} (${user.email})`);
+    // Remove sensitive data
+    delete user.password_hash;
+
+    console.log(`✅ User registered successfully: ${user.name} (ID: ${user.id})`);
 
     res.status(201).json({
       success: true,
@@ -165,13 +170,15 @@ router.post('/register', registerValidation, async (req, res) => {
 
   } catch (error) {
     console.error('❌ Registration error:', error);
+    console.error('Error message:', error.message);
+    console.error('Error code:', error.code);
+    console.error('Error detail:', error.detail);
 
-    // Handle duplicate email error
+    // Duplicate email error
     if (error.code === '23505') {
       return res.status(409).json({
         success: false,
-        message: 'User with this email already exists',
-        errors: [{ msg: 'Email already registered', param: 'email', location: 'body' }]
+        message: 'User with this email already exists'
       });
     }
 
@@ -190,7 +197,6 @@ router.post('/login', loginValidation, async (req, res) => {
   try {
     console.log('🔐 Login attempt:', req.body.email);
 
-    // Check validation errors
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({
@@ -204,17 +210,14 @@ router.post('/login', loginValidation, async (req, res) => {
 
     // Get user from database
     const result = await query(
-      `SELECT id, email, password_hash, name, age, country, gender, preferred_gender, 
-              avatar_url, is_premium, tokens, is_online, last_seen, total_calls, created_at 
-       FROM users WHERE LOWER(email) = LOWER($1)`,
-      [email.trim()]
+      'SELECT * FROM users WHERE email = $1',
+      [email.toLowerCase().trim()]
     );
 
     if (result.rows.length === 0) {
       return res.status(401).json({
         success: false,
-        message: 'Invalid email or password',
-        errors: [{ msg: 'Invalid credentials', param: 'email', location: 'body' }]
+        message: 'Invalid email or password'
       });
     }
 
@@ -222,47 +225,40 @@ router.post('/login', loginValidation, async (req, res) => {
 
     // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
+
     if (!isValidPassword) {
       return res.status(401).json({
         success: false,
-        message: 'Invalid email or password',
-        errors: [{ msg: 'Invalid credentials', param: 'password', location: 'body' }]
+        message: 'Invalid email or password'
       });
     }
 
     // Check if premium user has 0 tokens - downgrade to free
     if (user.is_premium && user.tokens <= 0) {
       await query(
-        'UPDATE users SET is_premium = false, preferred_gender = null WHERE id = $1',
-        [user.id]
+        'UPDATE users SET is_premium = $1, preferred_gender = $2 WHERE id = $3',
+        [false, null, user.id]
       );
       user.is_premium = false;
       user.preferred_gender = null;
-
-      console.log(`📉 User ${user.name} (${user.email}) downgraded to FREE - 0 tokens remaining`);
-
-      // Log downgrade transaction
-      await query(
-        'INSERT INTO transactions (user_id, type, tokens, description) VALUES ($1, $2, $3, $4)',
-        [user.id, 'downgrade', 0, 'Downgraded to FREE - premium tokens exhausted']
-      );
+      console.log(`📉 User ${user.name} downgraded to FREE`);
     }
 
     // Update online status
     await query(
-      'UPDATE users SET is_online = true, last_seen = CURRENT_TIMESTAMP WHERE id = $1',
-      [user.id]
+      'UPDATE users SET is_online = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2',
+      [true, user.id]
     );
 
     // Generate token
     const token = generateToken(user.id);
 
-    // Remove sensitive data from response
+    // Remove sensitive data
     delete user.password_hash;
     user.is_online = true;
     user.last_seen = new Date().toISOString();
 
-    console.log(`✅ Login successful: ${user.name} (${user.email})`);
+    console.log(`✅ Login successful: ${user.name}`);
 
     res.json({
       success: true,
@@ -288,12 +284,8 @@ router.post('/login', loginValidation, async (req, res) => {
 
 router.get('/me', authenticateToken, async (req, res) => {
   try {
-    // Get fresh user data from database
     const result = await query(
-      `SELECT id, email, name, age, country, gender, preferred_gender, avatar_url, bio, interests, 
-              is_premium, tokens, subscription_expires_at, premium_expiry, is_online, last_seen, 
-              total_calls, created_at 
-       FROM users WHERE id = $1`,
+      'SELECT * FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -304,10 +296,13 @@ router.get('/me', authenticateToken, async (req, res) => {
       });
     }
 
+    const user = result.rows[0];
+    delete user.password_hash;
+
     res.json({
       success: true,
       data: {
-        user: result.rows[0]
+        user
       }
     });
   } catch (error) {
@@ -368,17 +363,18 @@ router.put('/profile', authenticateToken, [
     const result = await query(
       `UPDATE users SET ${setClause}, updated_at = CURRENT_TIMESTAMP 
        WHERE id = $1 
-       RETURNING id, email, name, age, country, gender, preferred_gender, avatar_url, bio, 
-                 interests, is_premium, tokens, subscription_expires_at, premium_expiry, 
-                 is_online, last_seen, total_calls, updated_at`,
+       RETURNING *`,
       values
     );
+
+    const user = result.rows[0];
+    delete user.password_hash;
 
     res.json({
       success: true,
       message: 'Profile updated successfully',
       data: {
-        user: result.rows[0]
+        user
       }
     });
 
@@ -397,10 +393,9 @@ router.put('/profile', authenticateToken, [
 
 router.post('/logout', authenticateToken, async (req, res) => {
   try {
-    // Update offline status
     await query(
-      'UPDATE users SET is_online = false, last_seen = CURRENT_TIMESTAMP WHERE id = $1',
-      [req.user.id]
+      'UPDATE users SET is_online = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2',
+      [false, req.user.id]
     );
 
     res.json({
@@ -422,7 +417,7 @@ router.post('/logout', authenticateToken, async (req, res) => {
 
 router.post('/purchase-premium', authenticateToken, [
   body('plan').isIn(['basic', 'pro', 'unlimited']).withMessage('Invalid plan type'),
-  body('preferredGender').optional().isIn(['male', 'female', 'other']).withMessage('Invalid preferred gender')
+  body('preferredGender').optional().isIn(['male', 'female', 'other'])
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -436,7 +431,6 @@ router.post('/purchase-premium', authenticateToken, [
 
     const { plan, preferredGender } = req.body;
 
-    // Define plan details
     const planDetails = {
       basic: { tokens: 100, price: 9.99, description: 'Basic Plan - 100 tokens' },
       pro: { tokens: 300, price: 24.99, description: 'Pro Plan - 300 tokens' },
@@ -451,25 +445,18 @@ router.post('/purchase-premium', authenticateToken, [
       });
     }
 
-    // Update user to premium with tokens and preferred gender
     const result = await query(
       `UPDATE users SET 
-        is_premium = true, 
-        tokens = tokens + $1, 
-        preferred_gender = $2,
+        is_premium = $1, 
+        tokens = tokens + $2, 
+        preferred_gender = $3,
         premium_expiry = CURRENT_TIMESTAMP + INTERVAL '30 days'
-       WHERE id = $3 
+       WHERE id = $4 
        RETURNING id, email, name, tokens, is_premium, preferred_gender, premium_expiry`,
-      [selectedPlan.tokens, preferredGender || null, req.user.id]
+      [true, selectedPlan.tokens, preferredGender || null, req.user.id]
     );
 
-    // Log purchase transaction
-    await query(
-      'INSERT INTO transactions (user_id, type, tokens, amount, description) VALUES ($1, $2, $3, $4, $5)',
-      [req.user.id, 'purchase', selectedPlan.tokens, selectedPlan.price, selectedPlan.description]
-    );
-
-    console.log(`💎 User ${result.rows[0].name} upgraded to PREMIUM (${plan}) - ${selectedPlan.tokens} tokens added`);
+    console.log(`💎 User upgraded to PREMIUM (${plan}) - ${selectedPlan.tokens} tokens added`);
 
     res.json({
       success: true,
@@ -536,25 +523,14 @@ router.post('/deduct-tokens', authenticateToken, async (req, res) => {
       [tokenCost, req.user.id]
     );
 
-    await query(
-      'INSERT INTO transactions (user_id, type, tokens, description) VALUES ($1, $2, $3, $4)',
-      [req.user.id, 'call', -tokenCost, 'Video call connection - 8 tokens deducted']
-    );
-
     const remainingTokens = updateResult.rows[0].tokens;
 
     if (remainingTokens <= 0) {
       await query(
-        'UPDATE users SET is_premium = false, preferred_gender = null WHERE id = $1',
-        [req.user.id]
+        'UPDATE users SET is_premium = $1, preferred_gender = $2 WHERE id = $3',
+        [false, null, req.user.id]
       );
-
-      await query(
-        'INSERT INTO transactions (user_id, type, tokens, description) VALUES ($1, $2, $3, $4)',
-        [req.user.id, 'downgrade', 0, 'Auto-downgraded to FREE - tokens exhausted']
-      );
-
-      console.log(`📉 User auto-downgraded to FREE - 0 tokens remaining`);
+      console.log(`📉 User auto-downgraded to FREE`);
     }
 
     res.json({
