@@ -9,10 +9,12 @@ import nodemailer from 'nodemailer';
 // Real email sender using nodemailer
 async function sendVerificationEmail(email, code) {
   const transporter = nodemailer.createTransport({
-    service: 'gmail', // Change to your SMTP provider if needed
+    host: 'smtp.zoho.in',
+    port: 465,
+    secure: true, // SSL
     auth: {
-      user: 'your-email@gmail.com', // Replace with your email
-      pass: 'your-app-password' // Replace with your app password
+      user: 'noreply@swipx.in',
+      pass: 'Ritikyadav@123'
     }
   });
 
