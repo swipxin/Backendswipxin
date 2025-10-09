@@ -7,293 +7,298 @@ import rateLimit from 'express-rate-limit';
 import { query } from './config/database.js';
 import { socketAuth } from './middleware/auth.js';
 
-// Import routes
 import authRoutes from './routes/auth.js';
 import matchingRoutes from './routes/matching.js';
 
-// Configuration
-const PORT = 5002;
+const PORT = process.env.PORT || 5002;
 const FRONTEND_URLS = [
-
   "https://app.swipx.in",
   "https://realswipxin-45ia.vercel.app",
-  
-  "http://localhost:3000" // Local development
+  "http://localhost:3000"
 ];
 
 const app = express();
+app.set('trust proxy', 1);
+
 const server = createServer(app);
 const io = new Server(server, {
   cors: {
     origin: FRONTEND_URLS,
     methods: ["GET", "POST"],
     credentials: true
-  }
+  },
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
-// Security middleware
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" }
-}));
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
-// Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 100,
-  message: {
-    success: false,
-    message: 'Too many requests from this IP, please try again later.'
-  },
   standardHeaders: true,
   legacyHeaders: false,
 });
-
 app.use(limiter);
 
-// CORS middleware
-app.use(cors({
-  origin: FRONTEND_URLS,
-  credentials: true
-}));
-
-// Body parser middleware
+app.use(cors({ origin: FRONTEND_URLS, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
     success: true, 
-    message: 'SwipX Backend is running!', 
+    message: 'SwipX Backend Running', 
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    stats: {
+      activeUsers: activeUsers.size,
+      waitingUsers: waitingUsers.size,
+      activeRooms: rooms.size,
+      activeMatches: activeMatches.size
+    }
   });
 });
 
-// API routes
+app.get('/api/emergency-reset', (req, res) => {
+  const stats = { 
+    rooms: rooms.size, 
+    matches: activeMatches.size, 
+    waiting: waitingUsers.size,
+    active: activeUsers.size
+  };
+  
+  rooms.clear();
+  activeMatches.clear();
+  waitingUsers.clear();
+  
+  console.log(`🧹 RESET:`, stats);
+  res.json({ success: true, cleared: stats });
+});
+
 app.use('/api/auth', authRoutes);
 app.use('/api/matching', matchingRoutes);
 
-// Socket.IO authentication middleware
 io.use(socketAuth);
 
-// Store active users and their socket connections
-const activeUsers = new Map(); // userId -> { socketId, user }
-const waitingUsers = new Map(); // userId -> { user, preferences }
-const activeMatches = new Map(); // matchId -> { user1Id, user2Id, roomId }
-const rooms = new Map(); // roomId -> { participants: [socketId1, socketId2], matchId }
+const activeUsers = new Map();
+const waitingUsers = new Map();
+const activeMatches = new Map();
+const rooms = new Map();
 
-// Socket.IO connection handling
 io.on('connection', async (socket) => {
-  console.log(`\u2705 User connected: ${socket.user.name} (${socket.userId})`);
+  console.log(`✅ ${socket.user.name} (${socket.userId})`);
   
-  // Add user to active users
-  activeUsers.set(socket.userId, {
-    socketId: socket.id,
-    user: socket.user
-  });
+  activeUsers.set(socket.userId, { socketId: socket.id, user: socket.user });
 
-  // Update user online status in database
   try {
-    await query(
-      'UPDATE users SET is_online = true, last_seen = CURRENT_TIMESTAMP WHERE id = $1',
-      [socket.userId]
-    );
-
-    // Store session in database (with upsert logic)
-    await query(
-      'INSERT INTO user_sessions (user_id, socket_id, is_active) VALUES ($1, $2, true) ON CONFLICT DO NOTHING',
-      [socket.userId, socket.id]
-    ).catch(async () => {
-      // If conflict error or table doesn't exist, update existing record
-      await query(
-        'UPDATE user_sessions SET socket_id = $2, is_active = true, updated_at = CURRENT_TIMESTAMP WHERE user_id = $1',
-        [socket.userId, socket.id]
-      ).catch(() => {
-        // If user_sessions table doesn't exist, ignore this operation
-        console.log('user_sessions table not found, skipping session storage');
-      });
-    });
+    await query('UPDATE users SET is_online = true, last_seen = CURRENT_TIMESTAMP WHERE id = $1', [socket.userId]);
   } catch (error) {
-    console.error('Error updating user online status:', error);
+    console.error('Online err:', error);
   }
 
-  // Emit online users count
-  socket.broadcast.emit('userOnline', {
-    userId: socket.userId,
-    user: socket.user
-  });
+  socket.broadcast.emit('userOnline', { userId: socket.userId, user: socket.user });
 
-  // Handle user joining matching queue
   socket.on('joinMatchingQueue', async (preferences = {}) => {
     try {
-      console.log(`\ud83d\udd0d User ${socket.user.name} joined matching queue with preferences:`, preferences);
-      
-      // Check if user has enough tokens
-      if (socket.user.tokens < 1) {
-        socket.emit('matchingError', {
-          message: 'Insufficient tokens. You need at least 1 token to start a video call.'
-        });
-        return;
+      const user = socket.user;
+      console.log(`🔍 ${user.name} joining queue with filters:`, preferences);
+
+      if (user.is_premium) {
+        if (user.tokens < 8) {
+          console.log(`⚠️ ${user.name} insufficient tokens (${user.tokens})`);
+          socket.emit('matchingError', { message: 'Insufficient tokens. Please recharge!' });
+          return;
+        }
+      } else {
+        if (preferences.gender || preferences.country) {
+          socket.emit('matchingError', { 
+            message: 'Gender and Country filters are Premium features! Upgrade to Premium to use filters.' 
+          });
+          return;
+        }
       }
 
-      // Add user to waiting queue
-      waitingUsers.set(socket.userId, {
-        user: socket.user,
-        preferences,
-        socketId: socket.id,
-        joinedAt: Date.now()
+      waitingUsers.set(socket.userId, { 
+        user, 
+        preferences: {
+          gender: preferences.gender || null,
+          country: preferences.country || null,
+          minAge: preferences.minAge || 18,
+          maxAge: preferences.maxAge || 100
+        },
+        socketId: socket.id, 
+        joinedAt: Date.now() 
       });
 
-      console.log(`\ud83d\udcca Queue size after adding ${socket.user.name}: ${waitingUsers.size}`);
+      console.log(`📊 Queue: ${waitingUsers.size} users`);
 
-      socket.emit('matchingStatus', {
-        status: 'searching',
-        message: 'Looking for a match...'
+      socket.emit('matchingStatus', { 
+        status: 'searching', 
+        message: 'Searching for match...',
+        queueSize: waitingUsers.size,
+        filters: user.is_premium ? preferences : null
       });
 
-      // Try to find a match immediately
-      const matchFound = await findMatch(socket.userId);
+      const matchFound = await findMatchWithFilters(socket.userId);
       
-      // If no match found, but there are multiple users in queue, 
-      // try to process the entire queue to find any possible matches
       if (!matchFound && waitingUsers.size >= 2) {
-        console.log(`\ud83d\udd04 No immediate match found, processing entire queue...`);
         await processMatchingQueue();
       }
       
-      // Trigger matching for all waiting users when someone new joins
-      if (waitingUsers.size >= 2) {
-        setTimeout(async () => {
-          console.log(`\ud83d\udd0d Auto-triggering match processing for ${waitingUsers.size} users...`);
-          await processMatchingQueue();
-        }, 1000); // Small delay to ensure all users are properly added to queue
-      }
-
     } catch (error) {
-      console.error('Error joining matching queue:', error);
-      socket.emit('matchingError', {
-        message: 'Failed to join matching queue'
-      });
+      console.error('Queue err:', error);
+      socket.emit('matchingError', { message: 'Failed to join queue' });
     }
   });
 
-  // Handle leaving matching queue
   socket.on('leaveMatchingQueue', () => {
     waitingUsers.delete(socket.userId);
-    socket.emit('matchingStatus', {
-      status: 'idle',
-      message: 'Stopped searching for matches'
-    });
-    console.log(`\ud83d\udea8 User ${socket.user.name} left matching queue`);
+    console.log(`🚫 ${socket.user.name} left queue`);
+    socket.emit('matchingStatus', { status: 'idle' });
   });
 
-  // Handle WebRTC signaling
-  socket.on('webrtc-signal', (data) => {
-    const { roomId, signal, targetUserId } = data;
+  // ============================================
+  // 🔧 FIXED: joinVideoRoom with delay
+  // ============================================
+  socket.on('joinVideoRoom', (data) => {
+    const { roomId, matchId } = data;
+    console.log(`🚪 ${socket.user.name} → ${roomId} (socket: ${socket.id})`);
     
     if (rooms.has(roomId)) {
-      // Forward signal to the other participant in the room
       const room = rooms.get(roomId);
-      const targetSocketId = room.participants.find(id => id !== socket.id);
       
-      if (targetSocketId) {
-        io.to(targetSocketId).emit('webrtc-signal', {
-          signal,
-          fromUserId: socket.userId,
-          roomId
-        });
-        console.log(`\ud83d\udce1 WebRTC signal forwarded in room ${roomId}`);
+      if (room.participants.includes(socket.id)) {
+        console.log(`⚠️ ${socket.user.name} already in room`);
+        return;
+      }
+      
+      if (room.participants.length >= 2) {
+        console.log(`❌ Room ${roomId} FULL (${room.participants.length}/2)`);
+        socket.emit('roomFull', { roomId });
+        return;
+      }
+      
+      room.participants.push(socket.id);
+      socket.join(roomId);
+      console.log(`✅ ${socket.user.name} joined ${roomId} (${room.participants.length}/2)`);
+      
+      if (room.participants.length === 2) {
+        console.log(`🎬 Room ${roomId} is READY with 2 participants`);
+        console.log(`   Participants:`, room.participants);
+        
+        // ✅ CRITICAL FIX: Add 500ms delay + dual emission
+        setTimeout(() => {
+          console.log(`📤 Emitting roomReady to room: ${roomId}`);
+          
+          // Method 1: Emit to room
+          io.to(roomId).emit('roomReady', { roomId, matchId, participants: 2 });
+          
+          // Method 2: Direct emit to each socket (backup)
+          room.participants.forEach((participantSocketId, index) => {
+            io.to(participantSocketId).emit('roomReady', { 
+              roomId, 
+              matchId, 
+              participants: 2,
+              isInitiator: index === 0 // First user is initiator
+            });
+            console.log(`   📤 Direct roomReady → socket ${participantSocketId}`);
+          });
+          
+          console.log(`✅ roomReady emitted successfully`);
+        }, 500); // 500ms delay to ensure frontend listeners attached
+      }
+    } else {
+      rooms.set(roomId, { 
+        participants: [socket.id], 
+        matchId, 
+        createdAt: Date.now(), 
+        maxParticipants: 2 
+      });
+      socket.join(roomId);
+      console.log(`📦 ${socket.user.name} CREATED room ${roomId} (1/2)`);
+    }
+  });
+
+  socket.on('leaveVideoRoom', async (data) => {
+    const { roomId } = data;
+    socket.leave(roomId);
+    console.log(`🚪 ${socket.user.name} left ${roomId}`);
+
+    if (rooms.has(roomId)) {
+      const room = rooms.get(roomId);
+      room.participants = room.participants.filter(id => id !== socket.id);
+
+      if (room.participants.length === 0) {
+        rooms.delete(roomId);
+        console.log(`🗑️ Room ${roomId} deleted (empty)`);
+      } else {
+        socket.to(roomId).emit('participantLeft', { userId: socket.userId, roomId });
       }
     }
   });
 
-  // Handle joining a video call room
-  socket.on('joinVideoRoom', (data) => {
-    const { roomId, matchId } = data;
-    
-    socket.join(roomId);
-    
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, {
-        participants: [socket.id],
-        matchId,
-        createdAt: Date.now()
-      });
-    } else {
-      const room = rooms.get(roomId);
-      room.participants.push(socket.id);
-      
-      // Notify both participants that the room is ready
-      io.to(roomId).emit('roomReady', {
-        roomId,
-        matchId,
-        participants: room.participants.length
-      });
-    }
-    
-    console.log(`\ud83d\udcf9 User ${socket.user.name} joined video room ${roomId}`);
+  socket.on('webrtc-offer', (data) => {
+    console.log(`📤 ${socket.user.name} sending offer to room ${data.roomId}`);
+    socket.to(data.roomId).emit('webrtc-offer', { 
+      offer: data.offer, 
+      from: socket.userId, 
+      fromName: socket.user.name 
+    });
   });
 
-  // Handle leaving a video call room
-  socket.on('leaveVideoRoom', async (data) => {
+  socket.on('webrtc-answer', (data) => {
+    console.log(`📤 ${socket.user.name} sending answer to room ${data.roomId}`);
+    socket.to(data.roomId).emit('webrtc-answer', { 
+      answer: data.answer, 
+      from: socket.userId, 
+      fromName: socket.user.name 
+    });
+  });
+
+  socket.on('ice-candidate', (data) => {
+    socket.to(data.roomId).emit('ice-candidate', { 
+      candidate: data.candidate, 
+      from: socket.userId, 
+      fromName: socket.user.name 
+    });
+  });
+
+  socket.on('skipMatch', async (data) => {
     const { roomId, matchId } = data;
+    console.log(`⏭️ ${socket.user.name} skip`);
+    
+    socket.to(roomId).emit('partnerSkipped', { 
+      userId: socket.userId, 
+      userName: socket.user.name 
+    });
     
     socket.leave(roomId);
     
     if (rooms.has(roomId)) {
       const room = rooms.get(roomId);
       room.participants = room.participants.filter(id => id !== socket.id);
-      
-      // If no participants left, clean up the room
       if (room.participants.length === 0) {
         rooms.delete(roomId);
-        
-        // End the match in database
-        if (matchId) {
-          try {
-            await query('SELECT end_match($1, $2)', [matchId, socket.userId]);
-            console.log(`\ud83d\udd1a Match ${matchId} ended`);
-          } catch (error) {
-            console.error('Error ending match:', error);
-          }
-        }
-      } else {
-        // Notify remaining participants
-        socket.to(roomId).emit('participantLeft', {
-          userId: socket.userId,
-          roomId
-        });
       }
     }
     
-    console.log(`\ud83d\udeaa User ${socket.user.name} left video room ${roomId}`);
+    if (activeMatches.has(matchId)) {
+      activeMatches.delete(matchId);
+    }
   });
 
-  // Handle chat messages
   socket.on('sendMessage', async (data) => {
     try {
-      const { matchId, content, messageType = 'text' } = data;
-      
-      // Save message to database
       const result = await query(
-        'INSERT INTO messages (match_id, sender_id, content, message_type) VALUES ($1, $2, $3, $4) RETURNING *',
-        [matchId, socket.userId, content, messageType]
+        'INSERT INTO messages (match_id, sender_id, content, message_type) VALUES ($1, $2, $3, $4) RETURNING *', 
+        [data.matchId, socket.userId, data.content, data.messageType || 'text']
       );
-      
+        
       const message = result.rows[0];
-      
-      // Get the room ID for this match
-      const matchResult = await query(
-        'SELECT room_id FROM matches WHERE id = $1',
-        [matchId]
-      );
+      const matchResult = await query('SELECT room_id FROM matches WHERE id = $1', [data.matchId]);
       
       if (matchResult.rows.length > 0) {
-        const roomId = matchResult.rows[0].room_id;
-        
-        // Broadcast message to all participants in the room
-        io.to(roomId).emit('newMessage', {
+        io.to(matchResult.rows[0].room_id).emit('newMessage', {
           id: message.id,
           matchId: message.match_id,
           senderId: message.sender_id,
@@ -302,174 +307,138 @@ io.on('connection', async (socket) => {
           messageType: message.message_type,
           createdAt: message.created_at
         });
-        
-        console.log(`\ud83d\udcac Message sent in match ${matchId} by ${socket.user.name}`);
       }
     } catch (error) {
-      console.error('Error sending message:', error);
-      socket.emit('messageError', {
-        message: 'Failed to send message'
-      });
+      console.error('Msg err:', error);
+      socket.emit('messageError', { message: 'Failed' });
     }
   });
 
-  // Handle explicit online status updates
   socket.on('updateOnlineStatus', async (data) => {
+    if (data.userId !== socket.userId) return;
+    
     try {
-      const { userId, isOnline } = data;
+      await query('UPDATE users SET is_online = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2', 
+        [data.isOnline, socket.userId]);
       
-      // Only allow users to update their own status
-      if (userId !== socket.userId) {
-        console.warn(`User ${socket.userId} tried to update status for user ${userId}`);
-        return;
-      }
-      
-      // Update online status in database
-      await query(
-        'UPDATE users SET is_online = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2',
-        [isOnline, socket.userId]
-      );
-      
-      console.log(`🟢 Updated online status for user ${socket.user.name}: ${isOnline}`);
-      
-      // Broadcast status change to other users
-      if (isOnline) {
-        socket.broadcast.emit('userOnline', {
-          userId: socket.userId,
-          user: socket.user
-        });
+      if (data.isOnline) {
+        socket.broadcast.emit('userOnline', { userId: socket.userId, user: socket.user });
       } else {
-        socket.broadcast.emit('userOffline', {
-          userId: socket.userId
-        });
+        socket.broadcast.emit('userOffline', { userId: socket.userId });
       }
-      
     } catch (error) {
-      console.error('Error updating online status:', error);
+      console.error('Status err:', error);
     }
   });
 
-  // Handle disconnect
   socket.on('disconnect', async () => {
-    console.log(`\ud83d\udd34 User disconnected: ${socket.user.name} (${socket.userId})`);
+    console.log(`🔴 ${socket.user.name} disconnected`);
     
-    // Remove from active users
     activeUsers.delete(socket.userId);
     waitingUsers.delete(socket.userId);
-    
-    // Update user offline status in database
+
     try {
-      await query(
-        'UPDATE users SET is_online = false, last_seen = CURRENT_TIMESTAMP WHERE id = $1',
-        [socket.userId]
-      );
-      
-      // Update session status (if table exists)
-      await query(
-        'UPDATE user_sessions SET is_active = false WHERE user_id = $1',
-        [socket.userId]
-      ).catch(() => {
-        // If user_sessions table doesn't exist, ignore this operation
-        console.log('user_sessions table not found, skipping session update');
-      });
+      await query('UPDATE users SET is_online = false, last_seen = CURRENT_TIMESTAMP WHERE id = $1', 
+        [socket.userId]);
     } catch (error) {
-      console.error('Error updating user offline status:', error);
+      console.error('Offline err:', error);
     }
 
-    // Clean up any rooms the user was in
     for (const [roomId, room] of rooms.entries()) {
       if (room.participants.includes(socket.id)) {
         room.participants = room.participants.filter(id => id !== socket.id);
-        
-        // Notify other participants
-        socket.to(roomId).emit('participantLeft', {
-          userId: socket.userId,
-          roomId
-        });
-        
-        // If room is empty, clean up
+        socket.to(roomId).emit('participantLeft', { userId: socket.userId, roomId });
         if (room.participants.length === 0) {
           rooms.delete(roomId);
         }
       }
     }
 
-    // Emit user offline event
-    socket.broadcast.emit('userOffline', {
-      userId: socket.userId
-    });
+    socket.broadcast.emit('userOffline', { userId: socket.userId });
   });
 });
 
-// Function to find matches (Direct matching without gender filtering)
-async function findMatch(userId) {
+async function findMatchWithFilters(userId) {
   try {
     const waitingUser = waitingUsers.get(userId);
-    if (!waitingUser) {
-      console.log(`⚠️ User ${userId} not found in waiting queue`);
-      return;
-    }
+    if (!waitingUser) return false;
 
-    const { user } = waitingUser;
-    
-    console.log(`🔍 Looking for match for ${user.name}. ${waitingUsers.size} users in queue.`);
-    console.log(`📋 Current queue:`, Array.from(waitingUsers.keys()).map(id => {
-      const userData = waitingUsers.get(id);
-      return `${userData.user.name} (${id})`;
-    }));
-    
-    // Find any other waiting user (excluding current user)
+    const userPrefs = waitingUser.preferences;
     let matchedUserId = null;
     let matchedUserData = null;
     
     for (const [otherUserId, otherUserData] of waitingUsers.entries()) {
-      // Skip self and check if other user is still active and connected
-      if (otherUserId !== userId && 
-          activeUsers.has(otherUserId) && 
-          otherUserData.socketId && 
-          io.sockets.sockets.has(otherUserData.socketId)) {
+      if (otherUserId === userId) continue;
+      
+      if (!activeUsers.has(otherUserId) || !io.sockets.sockets.has(otherUserData.socketId)) continue;
+
+      const otherPrefs = otherUserData.preferences;
+      const otherUser = otherUserData.user;
+
+      let isMatch = true;
+
+      if (userPrefs.gender && otherUser.gender !== userPrefs.gender) {
+        isMatch = false;
+      }
+      if (userPrefs.country && otherUser.country !== userPrefs.country) {
+        isMatch = false;
+      }
+      if (otherUser.age < userPrefs.minAge || otherUser.age > userPrefs.maxAge) {
+        isMatch = false;
+      }
+
+      if (otherPrefs.gender && waitingUser.user.gender !== otherPrefs.gender) {
+        isMatch = false;
+      }
+      if (otherPrefs.country && waitingUser.user.country !== otherPrefs.country) {
+        isMatch = false;
+      }
+      if (waitingUser.user.age < otherPrefs.minAge || waitingUser.user.age > otherPrefs.maxAge) {
+        isMatch = false;
+      }
+
+      if (isMatch) {
         matchedUserId = otherUserId;
         matchedUserData = otherUserData;
-        console.log(`🎯 Found potential match: ${otherUserData.user.name}`);
         break;
       }
     }
 
     if (matchedUserId && matchedUserData) {
-      console.log(`✅ Confirmed match: ${user.name} <-> ${matchedUserData.user.name}`);
-      
-      // Generate unique match and room IDs
+      console.log(`🎯 MATCH: ${waitingUser.user.name} ↔ ${matchedUserData.user.name}`);
+
+      const idsToDeduct = [];
+      if (waitingUser.user.is_premium) idsToDeduct.push(userId);
+      if (matchedUserData.user.is_premium) idsToDeduct.push(matchedUserId);
+
+      if (idsToDeduct.length > 0) {
+        try {
+          await query('UPDATE users SET tokens = tokens - 8 WHERE id = ANY($1) AND is_premium = true AND tokens >= 8', 
+            [idsToDeduct]);
+          console.log(`💰 -8 tokens from ${idsToDeduct.length} users`);
+        } catch (error) {
+          console.error('Token err:', error);
+        }
+      }
+
       const matchId = `match-${userId}-${matchedUserId}-${Date.now()}`;
       const roomId = `room-${matchId}`;
-      
-      // Remove both users from waiting queue FIRST to prevent race conditions
-      const user1Data = waitingUsers.get(userId);
-      const user2Data = waitingUsers.get(matchedUserId);
+
       waitingUsers.delete(userId);
       waitingUsers.delete(matchedUserId);
-      console.log(`🗑️ Removed both users from queue. Remaining: ${waitingUsers.size}`);
       
-      // Store active match
-      activeMatches.set(matchId, {
-        user1Id: userId,
-        user2Id: matchedUserId,
-        roomId,
-        startedAt: Date.now()
+      activeMatches.set(matchId, { 
+        user1Id: userId, 
+        user2Id: matchedUserId, 
+        roomId, 
+        startedAt: Date.now() 
       });
-      
-      // Get socket connections
+
       const user1Socket = activeUsers.get(userId);
       const user2Socket = activeUsers.get(matchedUserId);
-      
-      // Validate socket connections more thoroughly
-      const user1SocketExists = user1Socket && io.sockets.sockets.has(user1Socket.socketId);
-      const user2SocketExists = user2Socket && io.sockets.sockets.has(user2Socket.socketId);
-      
-      console.log(`🔍 Socket validation - User1: ${user1SocketExists ? '✅' : '❌'}, User2: ${user2SocketExists ? '✅' : '❌'}`);
-      
-      if (user1SocketExists && user2SocketExists) {
-        // Create match data for both users
-        const matchDataForUser1 = {
+
+      if (user1Socket && user2Socket) {
+        io.to(user1Socket.socketId).emit('matchFound', {
           matchId,
           roomId,
           partner: {
@@ -481,266 +450,97 @@ async function findMatch(userId) {
             avatar_url: matchedUserData.user.avatar_url
           },
           isInitiator: true
-        };
+        });
         
-        const matchDataForUser2 = {
+        io.to(user2Socket.socketId).emit('matchFound', {
           matchId,
           roomId,
           partner: {
             id: userId,
-            name: user.name,
-            age: user.age,
-            country: user.country,
-            gender: user.gender,
-            avatar_url: user.avatar_url
+            name: waitingUser.user.name,
+            age: waitingUser.user.age,
+            country: waitingUser.user.country,
+            gender: waitingUser.user.gender,
+            avatar_url: waitingUser.user.avatar_url
           },
           isInitiator: false
-        };
-        
-        console.log(`📤 Sending match notification to ${user.name} (${user1Socket.socketId})`);
-        console.log(`📤 Sending match notification to ${matchedUserData.user.name} (${user2Socket.socketId})`);
-        
-        // Notify both users about the match
-        io.to(user1Socket.socketId).emit('matchFound', matchDataForUser1);
-        io.to(user2Socket.socketId).emit('matchFound', matchDataForUser2);
-        
-        console.log(`🎉 Match notifications sent: ${user.name} <-> ${matchedUserData.user.name} (Room: ${roomId})`);
-        
-        // Try to deduct tokens from both users
-        try {
-          await query('UPDATE users SET tokens = tokens - 1 WHERE id IN ($1, $2) AND tokens > 0', [userId, matchedUserId]);
-          console.log(`💰 Tokens deducted for match ${matchId}`);
-        } catch (error) {
-          console.log('⚠️ Could not deduct tokens (continuing anyway):', error.message);
-        }
-        
-        return true; // Match found and processed
-      } else {
-        console.log(`❌ Invalid socket connections - User1Socket: ${user1Socket?.socketId}, User2Socket: ${user2Socket?.socketId}`);
-        console.log(`❌ Re-adding users to queue due to socket issues`);
-        // Re-add users to queue if socket connection is lost
-        if (user1Data) waitingUsers.set(userId, user1Data);
-        if (user2Data) waitingUsers.set(matchedUserId, user2Data);
-        return false;
-      }
-    } else {
-      console.log(`⏳ No available match for ${user.name}. Staying in queue with ${waitingUsers.size} total users.`);
-      
-      // Send status update to user
-      const userSocket = activeUsers.get(userId);
-      if (userSocket) {
-        io.to(userSocket.socketId).emit('matchingStatus', {
-          status: 'searching',
-          message: `Looking for match... ${waitingUsers.size} users in queue`,
-          queueSize: waitingUsers.size
         });
+
+        return true;
       }
     }
     
-    return false; // No match found
+    return false;
   } catch (error) {
-    console.error('❌ Error finding match:', error);
+    console.error('Match err:', error);
     return false;
   }
 }
 
-// Process entire matching queue to find any possible matches
 async function processMatchingQueue() {
-  try {
-    console.log(`🔄 Processing matching queue with ${waitingUsers.size} users`);
-    
-    if (waitingUsers.size < 2) {
-      console.log('⚠️ Not enough users in queue for matching');
-      return;
-    }
-    
-    const userIds = Array.from(waitingUsers.keys());
-    const processedUsers = new Set();
-    let matchesFound = 0;
-    
-    // Try to match users in pairs
-    for (let i = 0; i < userIds.length; i++) {
-      const userId1 = userIds[i];
-      
-      // Skip if this user has already been matched or removed
-      if (processedUsers.has(userId1) || !waitingUsers.has(userId1)) {
-        continue;
-      }
-      
-      for (let j = i + 1; j < userIds.length; j++) {
-        const userId2 = userIds[j];
-        
-        // Skip if this user has already been matched or removed
-        if (processedUsers.has(userId2) || !waitingUsers.has(userId2)) {
-          continue;
-        }
-        
-        // Check if both users are still active and connected
-        const user1Data = waitingUsers.get(userId1);
-        const user2Data = waitingUsers.get(userId2);
-        
-        if (user1Data && user2Data && 
-            activeUsers.has(userId1) && activeUsers.has(userId2) &&
-            io.sockets.sockets.has(user1Data.socketId) && 
-            io.sockets.sockets.has(user2Data.socketId)) {
-          
-          console.log(`🎯 Processing queue match: ${user1Data.user.name} <-> ${user2Data.user.name}`);
-          
-          // Generate unique match and room IDs
-          const matchId = `match-${userId1}-${userId2}-${Date.now()}`;
-          const roomId = `room-${matchId}`;
-          
-          // Remove both users from waiting queue
-          waitingUsers.delete(userId1);
-          waitingUsers.delete(userId2);
-          
-          // Mark as processed
-          processedUsers.add(userId1);
-          processedUsers.add(userId2);
-          
-          // Store active match
-          activeMatches.set(matchId, {
-            user1Id: userId1,
-            user2Id: userId2,
-            roomId,
-            startedAt: Date.now()
-          });
-          
-          // Get socket connections
-          const user1Socket = activeUsers.get(userId1);
-          const user2Socket = activeUsers.get(userId2);
-          
-          if (user1Socket && user2Socket) {
-            // Create match data
-            const matchDataForUser1 = {
-              matchId,
-              roomId,
-              partner: {
-                id: userId2,
-                name: user2Data.user.name,
-                age: user2Data.user.age,
-                country: user2Data.user.country,
-                gender: user2Data.user.gender,
-                avatar_url: user2Data.user.avatar_url
-              },
-              isInitiator: true
-            };
-            
-            const matchDataForUser2 = {
-              matchId,
-              roomId,
-              partner: {
-                id: userId1,
-                name: user1Data.user.name,
-                age: user1Data.user.age,
-                country: user1Data.user.country,
-                gender: user1Data.user.gender,
-                avatar_url: user1Data.user.avatar_url
-              },
-              isInitiator: false
-            };
-            
-            // Notify both users about the match
-            io.to(user1Socket.socketId).emit('matchFound', matchDataForUser1);
-            io.to(user2Socket.socketId).emit('matchFound', matchDataForUser2);
-            
-            console.log(`🎉 Queue match created: ${user1Data.user.name} <-> ${user2Data.user.name}`);
-            matchesFound++;
-            
-            // Try to deduct tokens from both users
-            try {
-              await query('UPDATE users SET tokens = tokens - 1 WHERE id IN ($1, $2) AND tokens > 0', [userId1, userId2]);
-              console.log(`💰 Tokens deducted for queue match ${matchId}`);
-            } catch (error) {
-              console.log('⚠️ Could not deduct tokens for queue match:', error.message);
-            }
-            
-            // Break inner loop since user1 is now matched
-            break;
-          }
-        }
-      }
-    }
-    
-    console.log(`✅ Queue processing complete. ${matchesFound} matches created. ${waitingUsers.size} users remaining.`);
-    
-  } catch (error) {
-    console.error('❌ Error processing matching queue:', error);
+  if (waitingUsers.size < 2) return;
+  console.log(`🔄 Queue: ${waitingUsers.size}`);
+
+  const userIds = Array.from(waitingUsers.keys());
+
+  for (const userId of userIds) {
+    if (!waitingUsers.has(userId)) continue;
+    await findMatchWithFilters(userId);
   }
 }
 
-// Periodic automatic matching for waiting users
 setInterval(async () => {
   if (waitingUsers.size >= 2) {
-    console.log(`🔄 Periodic matching check: ${waitingUsers.size} users waiting`);
     await processMatchingQueue();
   }
-}, 5000); // Check every 5 seconds for matches
+}, 5000);
 
-// Periodic cleanup of stale waiting users and rooms
 setInterval(() => {
   const now = Date.now();
-  const maxWaitTime = 5 * 60 * 1000; // 5 minutes
   
-  // Clean up stale waiting users
   for (const [userId, data] of waitingUsers.entries()) {
-    if (now - data.joinedAt > maxWaitTime) {
+    if (now - data.joinedAt > 300_000) {
       waitingUsers.delete(userId);
       const userSocket = activeUsers.get(userId);
       if (userSocket) {
-        io.to(userSocket.socketId).emit('matchingTimeout', {
-          message: 'No matches found. Please try again.'
-        });
+        io.to(userSocket.socketId).emit('matchingTimeout', { message: 'Timeout' });
       }
     }
   }
   
-  // Clean up empty rooms
   for (const [roomId, room] of rooms.entries()) {
     if (room.participants.length === 0) {
       rooms.delete(roomId);
     }
   }
-}, 60000); // Run every minute
+}, 60_000);
 
-// Error handling middleware
+setInterval(async () => {
+  try {
+    await query('UPDATE users SET is_premium = false WHERE premium_expiry_date < CURRENT_TIMESTAMP AND is_premium = true');
+  } catch (error) {
+    console.error('Premium expiry err:', error);
+  }
+}, 3600_000);
+
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error'
-  });
+  console.error('Err:', err);
+  res.status(500).json({ success: false, message: 'Error' });
 });
 
-// 404 handler
 app.use('*', (req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'Route not found'
-  });
+  res.status(404).json({ success: false, message: 'Not found' });
 });
 
-// Start server
-server.listen(PORT, () => {
-  console.log(`\u2728 SwipX Backend server running on port ${PORT}`);
-  console.log(`\ud83c\udf10 Environment: development`);
-  console.log(`\ud83d\udcca Health check: http://localhost:${PORT}/health`);
-  console.log(`\ud83d\udce1 Socket.IO enabled with CORS:`, FRONTEND_URLS);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✨ SwipX Backend: ${PORT}`);
+  console.log(`📊 Health: http://localhost:${PORT}/health`);
 });
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('\ud83d\udea8 SIGTERM received, shutting down gracefully...');
-  server.close(() => {
-    console.log('\u2705 Server closed');
-    process.exit(0);
-  });
+process.on('SIGTERM', () => {
+  server.close(() => process.exit(0));
 });
 
-process.on('SIGINT', async () => {
-  console.log('\ud83d\udea8 SIGINT received, shutting down gracefully...');
-  server.close(() => {
-    console.log('\u2705 Server closed');
-    process.exit(0);
-  });
+process.on('SIGINT', () => {
+  server.close(() => process.exit(0));
 });
