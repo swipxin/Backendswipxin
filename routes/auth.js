@@ -3,7 +3,29 @@ import bcrypt from 'bcryptjs';
 import { body, validationResult } from 'express-validator';
 import { query } from '../config/database.js';
 import { generateToken, authenticateToken } from '../middleware/auth.js';
+import crypto from 'crypto';
+import nodemailer from 'nodemailer';
 
+// Real email sender using nodemailer
+async function sendVerificationEmail(email, code) {
+  const transporter = nodemailer.createTransport({
+    service: 'gmail', // Change to your SMTP provider if needed
+    auth: {
+      user: 'your-email@gmail.com', // Replace with your email
+      pass: 'your-app-password' // Replace with your app password
+    }
+  });
+
+  const mailOptions = {
+    from: 'your-email@gmail.com', // Replace with your email
+    to: email,
+    subject: 'SwipX Email Verification',
+    text: `Your verification code is: ${code}`
+  };
+
+  await transporter.sendMail(mailOptions);
+  console.log(`📧 Verification email sent to ${email}`);
+}
 const router = express.Router();
 
 // ============================================
@@ -109,10 +131,10 @@ router.post('/register', registerValidation, async (req, res) => {
       });
     }
 
-    const { email, password, name, age, country, gender } = req.body;
+  const { email, password, name, age, country, gender } = req.body;
 
-    // Set default country
-    const userCountry = country || 'Unknown';
+  // Set default country
+  const userCountry = country || 'Unknown';
 
     // Check if user exists
     const existingUser = await query(
@@ -128,16 +150,19 @@ router.post('/register', registerValidation, async (req, res) => {
       });
     }
 
-    // Hash password
-    const saltRounds = 12;
-    const passwordHash = await bcrypt.hash(password, saltRounds);
+  // Hash password
+  const saltRounds = 12;
+  const passwordHash = await bcrypt.hash(password, saltRounds);
+
+  // Generate verification code
+  const verificationCode = crypto.randomBytes(3).toString('hex');
 
     console.log('💾 Inserting user into database...');
 
-    // ✅ MINIMAL INSERT - ONLY CORE COLUMNS
+    // ✅ MINIMAL INSERT - ONLY CORE COLUMNS + is_verified + verification_code
     const result = await query(
-      `INSERT INTO users (email, password_hash, name, age, country, gender) 
-       VALUES ($1, $2, $3, $4, $5, $6) 
+      `INSERT INTO users (email, password_hash, name, age, country, gender, is_verified, verification_code) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
        RETURNING *`,
       [
         email.toLowerCase().trim(),
@@ -145,28 +170,58 @@ router.post('/register', registerValidation, async (req, res) => {
         name.trim(),
         age,
         userCountry,
-        gender
+        gender,
+        false,
+        verificationCode
       ]
     );
 
-    const user = result.rows[0];
+    // Send verification email
+    await sendVerificationEmail(email, verificationCode);
 
-    // Generate JWT token
-    const token = generateToken(user.id);
+    const user = result.rows[0];
 
     // Remove sensitive data
     delete user.password_hash;
+    delete user.verification_code;
 
     console.log(`✅ User registered successfully: ${user.name} (ID: ${user.id})`);
 
     res.status(201).json({
       success: true,
-      message: 'Account created successfully! Welcome to SwipX!',
+      message: 'Account created! Please check your email for verification code.',
       data: {
-        user,
-        token
+        user
       }
     });
+// ============================================
+// VERIFY ENDPOINT
+// ============================================
+
+router.post('/verify', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) {
+      return res.status(400).json({ success: false, message: 'Email and code required' });
+    }
+    const result = await query('SELECT id, is_verified, verification_code FROM users WHERE email = $1', [email.toLowerCase().trim()]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    const user = result.rows[0];
+    if (user.is_verified) {
+      return res.json({ success: true, message: 'Already verified' });
+    }
+    if (user.verification_code !== code) {
+      return res.status(400).json({ success: false, message: 'Invalid verification code' });
+    }
+    await query('UPDATE users SET is_verified = true, verification_code = NULL WHERE id = $1', [user.id]);
+    return res.json({ success: true, message: 'Email verified successfully!' });
+  } catch (error) {
+    console.error('Verify error:', error);
+    res.status(500).json({ success: false, message: 'Verification failed' });
+  }
+});
 
   } catch (error) {
     console.error('❌ Registration error:', error);
