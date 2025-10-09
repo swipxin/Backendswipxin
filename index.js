@@ -17,7 +17,7 @@ const FRONTEND_URLS = [
 
   "https://app.swipx.in",
   "https://realswipxin-45ia.vercel.app",
-  
+  "http://127.0.0.1:3001",
   "http://localhost:3000" // Local development
 ];
 
